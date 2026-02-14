@@ -1,6 +1,7 @@
 import folium
 import pandas as pd
 import requests
+import json
 from folium.features import GeoJsonTooltip
 
 df = pd.read_csv('marginacion_cdmx.csv', encoding='utf-8')
@@ -8,34 +9,33 @@ df = pd.read_csv('marginacion_cdmx.csv', encoding='utf-8')
 df['nombre_col'] = df['nombre de la colonia'].astype(str).str.strip().str.upper() \
     .str.replace(r'^COL\.?\s*', '', regex=True) \
     .str.replace(r'^COLONIA\s*', '', regex=True) \
-    .str.replace(r'^AMPL\s*', '', regex=True) \
+    .str.replace(r'^AMPL?\.?\s*', '', regex=True) \
     .str.replace(r'^AMPLIACION\s*', '', regex=True) \
-    .str.replace(r'^AMP\s*', '', regex=True) \
     .str.replace(r'\s+', ' ', regex=True) \
-    .str.replace('Á', 'A').str.replace('É', 'E').str.replace('Í', 'I').str.replace('Ó', 'O').str.replace('Ú', 'U') \
-    .str.replace('Ñ', 'N') 
+    .str.replace(r'Á', 'A', regex=True).str.replace(r'É', 'E', regex=True) \
+    .str.replace(r'Í', 'I', regex=True).str.replace(r'Ó', 'O', regex=True) \
+    .str.replace(r'Ú', 'U', regex=True).str.replace(r'Ñ', 'N', regex=True)
 
 df['grado'] = df['grado de marginación'].astype(str).str.strip().str.title()
 
-print("Colonias cargadas en CSV:", len(df))
-print("Muestra nombres limpios:", df['nombre_col'].head(8).tolist())
-print("Grados únicos:", df['grado'].value_counts().to_dict())
+geojson_path = 'catalogo-colonias.geojson'
+try:
+    with open(geojson_path, 'r', encoding='utf-8') as f:
+        geojson_data = json.load(f)
+except FileNotFoundError:
+    geojson_url = "https://raw.githubusercontent.com/open-mexico/mexico-geojson/main/09-Cdmx.geojson"
+    response = requests.get(geojson_url)
+    response.raise_for_status()
+    geojson_data = response.json()
 
-geojson_url = "https://raw.githubusercontent.com/angel-cervantes/cdmx-geojson/main/colonias.geojson"
-response = requests.get(geojson_url)
-if response.status_code != 200:
-    print("Error cargando GeoJSON:", response.status_code)
-    print("Alternativa: descarga https://datos.cdmx.gob.mx/dataset/catalogo-de-colonias-datos-abiertos/resource/026b42d3-a609-44c7-a83d-22b2150caffc/download/catalogo-colonias.geojson y usa with open()")
-    exit()
-
-geojson_data = response.json()
-print("Colonias en GeoJSON:", len(geojson_data['features']))
+USE_CP_JOIN = 'd_codigo' in geojson_data['features'][0]['properties'] if 'features' in geojson_data else False
+NOMBRE_FIELD = 'nom_col'
 
 m = folium.Map(location=[19.4326, -99.1332], zoom_start=11, tiles='CartoDB positron')
 
 def get_color(grado):
     grado = str(grado).title()
-    if 'Muy Alto' in grado or 'Muy alto' in grado:
+    if 'Muy Alto' in grado:
         return '#8B0000'
     elif 'Alto' in grado:
         return '#FF4500'
@@ -43,31 +43,29 @@ def get_color(grado):
         return '#FFA500'
     elif 'Bajo' in grado:
         return '#FFD700'
-    elif 'Muy Bajo' in grado or 'Muy bajo' in grado:
+    elif 'Muy Bajo' in grado:
         return '#90EE90'
-    else:
-        return '#D3D3D3'
+    return '#D3D3D3'
 
 def style_function(feature):
-    nombre_geo_raw = feature['properties'].get('nom_col', '')
-    nombre_geo = str(nombre_geo_raw).strip().upper() \
-        .replace(r'^COL\.?\s*', '', regex=True) \
-        .replace(r'^COLONIA\s*', '', regex=True) \
-        .replace(r'^AMPL\s*', '', regex=True) \
-        .replace(r'^AMPLIACION\s*', '', regex=True) \
-        .replace(r'^AMP\s*', '', regex=True) \
-        .replace(r'\s+', ' ', regex=True) \
-        .replace('Á', 'A').replace('É', 'E').replace('Í', 'I').replace('Ó', 'O').replace('Ú', 'U') \
-        .replace('Ñ', 'N')
+    if USE_CP_JOIN:
+        key = feature['properties'].get('d_codigo', '').strip()
+        match = df[df['código postal'].astype(str).str.strip() == key]
+    else:
+        nombre_geo = str(feature['properties'].get(NOMBRE_FIELD, '')).strip().upper()
+        nombre_geo = nombre_geo.replace(r'^COL\.?\s*', '').replace(r'^COLONIA\s*', '') \
+                               .replace(r'^AMPL?\.?\s*', '').replace(r'^AMPLIACION\s*', '') \
+                               .replace(r'\s+', ' ').replace('Á', 'A').replace('É', 'E') \
+                               .replace('Í', 'I').replace('Ó', 'O').replace('Ú', 'U').replace('Ñ', 'N')
+        match = df[df['nombre_col'] == nombre_geo]
 
-    match = df[df['nombre_col'] == nombre_geo]
     if not match.empty:
         grado = match['grado'].iloc[0]
         opacity = 0.7
     else:
         grado = 'Sin dato'
         opacity = 0.3
-    
+
     return {
         'fillColor': get_color(grado),
         'color': '#555555',
@@ -77,52 +75,26 @@ def style_function(feature):
 
 folium.GeoJson(
     geojson_data,
-    name='Colonias CDMX - Marginación',
     style_function=style_function,
     tooltip=GeoJsonTooltip(
-        fields=['nom_col'],
-        aliases=['Colonia:'],
-        sticky=True,
-        style="font-size: 12px; background-color: white; border: 1px solid gray;"
+        fields=[NOMBRE_FIELD if not USE_CP_JOIN else 'd_codigo'],
+        aliases=['Colonia:' if not USE_CP_JOIN else 'C.P.:'],
+        sticky=True
     )
 ).add_to(m)
 
 legend_html = '''
 <div style="position: fixed; bottom: 50px; left: 50px; width: 240px; height: 200px; 
-     border:2px solid grey; z-index:9999; font-size:14px; background-color:white; 
-     padding:10px; border-radius:5px; opacity:0.9;">
-<b>Densidad del lumpenproletariat por marginación</b><br>
-<i style="background:#8B0000">&nbsp;&nbsp;&nbsp;</i> Muy Alto<br>
-<i style="background:#FF4500">&nbsp;&nbsp;&nbsp;</i> Alto<br>
-<i style="background:#FFA500">&nbsp;&nbsp;&nbsp;</i> Medio<br>
-<i style="background:#FFD700">&nbsp;&nbsp;&nbsp;</i> Bajo<br>
-<i style="background:#90EE90">&nbsp;&nbsp;&nbsp;</i> Muy Bajo<br>
-<i style="background:#D3D3D3">&nbsp;&nbsp;&nbsp;</i> Sin dato
+border:2px solid grey; z-index:9999; font-size:14px; background:white; padding:10px; opacity:0.9;">
+<b>Grado Marginación 2020</b><br>
+<i style="background:#8B0000">&nbsp;&nbsp;</i> Muy Alto<br>
+<i style="background:#FF4500">&nbsp;&nbsp;</i> Alto<br>
+<i style="background:#FFA500">&nbsp;&nbsp;</i> Medio<br>
+<i style="background:#FFD700">&nbsp;&nbsp;</i> Bajo<br>
+<i style="background:#90EE90">&nbsp;&nbsp;</i> Muy Bajo<br>
+<i style="background:#D3D3D3">&nbsp;&nbsp;</i> Sin dato
 </div>
 '''
 m.get_root().html.add_child(folium.Element(legend_html))
 
-matched = 0
-unmatched_names = set()
-for feature in geojson_data['features']:
-    nombre_geo_raw = feature['properties'].get('nom_col', '')
-    nombre_geo = str(nombre_geo_raw).strip().upper() \
-        .replace(r'^COL\.?\s*', '', regex=True) \
-        .replace(r'^COLONIA\s*', '', regex=True) \
-        .replace(r'^AMPL\s*', '', regex=True) \
-        .replace(r'^AMPLIACION\s*', '', regex=True) \
-        .replace(r'^AMP\s*', '', regex=True) \
-        .replace(r'\s+', ' ', regex=True) \
-        .replace('Á', 'A').replace('É', 'E').replace('Í', 'I').replace('Ó', 'O').replace('Ú', 'U') \
-        .replace('Ñ', 'N')
-    if not df[df['nombre_col'] == nombre_geo].empty:
-        matched += 1
-    else:
-        unmatched_names.add(nombre_geo_raw)
-
-print(f"Colonias matched: {matched} de {len(geojson_data['features'])} ({matched / len(geojson_data['features']) * 100:.1f}%)")
-print("Ejemplos GeoJSON sin match (originales):", list(unmatched_names)[:10])
-
 m.save('index.html')
-print("Mapa generado como 'index.html'. Ábrelo en tu navegador.")
-print("Si aún muchos grises, compara muestras de nombres y ajusta limpieza.")
